@@ -1,5 +1,7 @@
 # Import necessary modules
 import time
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:32"
 import torch
 import torch.nn as nn
 
@@ -8,15 +10,17 @@ from .data import get_loaders
 
 from collections import defaultdict
 import fnmatch
-
+from torch.cuda.amp import autocast
 
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
 def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
+    model.to(device)
+    model.eval()
     # Set dataset
     dataset = "wikitext2"
 
     # Print status
-    print(f"evaluating on {dataset}")
+    print(f"Evaluating on {dataset}")
 
     # Get the test loader
     _, testloader = get_loaders(
@@ -28,102 +32,86 @@ def eval_ppl(model, tokenizer, device=torch.device("cuda:0")):
         ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
     return ppl_test 
 
-# Function to evaluate perplexity (ppl) specifically on the wikitext dataset
+# Function to evaluate perplexity (ppl) specifically on the wikitext dataset for training data
 def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
-    # Get input IDs
-    # testenc = testenc.input_ids
-
-    # Calculate number of samples
-    # nsamples = testenc.numel() // model.seqlen
+    model.eval()
+    model.to(device)
     nsamples = len(trainloader)
 
-    # List to store negative log likelihoods
-    nlls = []
+    nll_sum = 0.0
     print(f"nsamples {nsamples}")
 
-    # Loop through each batch
-    for i in range(0,nsamples,bs):
+    for i in range(0, nsamples, bs):
         if i % 50 == 0:
-            print(f"sample {i}")
+            print(f"Processing sample {i}/{nsamples}")
 
-        # Calculate end index
         j = min(i+bs, nsamples)
 
-        # Prepare inputs and move to device
-        # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
         inputs = trainloader[i][0].to(device)
         inputs = inputs.reshape(j-i, model.seqlen)
 
-        # Forward pass through the model
-        lm_logits = model(inputs).logits
+        with autocast():
+            lm_logits = model(inputs).logits
 
-        # Shift logits and labels for next token prediction
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
 
-        # Compute loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        # Calculate negative log likelihood
         neg_log_likelihood = loss.float() * model.seqlen * (j-i)
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+        nll_sum += neg_log_likelihood
 
-    # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+        # Delete intermediate variables to free memory
+        del lm_logits, shift_logits, shift_labels, loss, neg_log_likelihood
+        torch.cuda.empty_cache()
 
-    # Empty CUDA cache to save memory
+    ppl = torch.exp(nll_sum / (nsamples * model.seqlen))
+
     torch.cuda.empty_cache()
 
     return ppl.item()
 
-# Function to evaluate perplexity (ppl) specifically on the wikitext dataset
+# Function to evaluate perplexity (ppl) specifically on the wikitext dataset for test data
 def eval_ppl_wikitext(model, testenc, bs=1, device=None):
-    # Get input IDs
+    model.eval()
+    model.to(device)
     testenc = testenc.input_ids
 
-    # Calculate number of samples
     nsamples = testenc.numel() // model.seqlen
 
-    # List to store negative log likelihoods
-    nlls = []
+    nll_sum = 0.0
     print(f"nsamples {nsamples}")
 
-    # Loop through each batch
-    for i in range(0,nsamples,bs):
+    for i in range(0, nsamples, bs):
         if i % 50 == 0:
-            print(f"sample {i}")
+            print(f"Processing sample {i}/{nsamples}")
 
-        # Calculate end index
         j = min(i+bs, nsamples)
 
-        # Prepare inputs and move to device
-        inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
+        inputs = testenc[:, (i * model.seqlen):(j * model.seqlen)].to(device)
         inputs = inputs.reshape(j-i, model.seqlen)
 
-        # Forward pass through the model
-        lm_logits = model(inputs).logits
+        with autocast():
+            lm_logits = model(inputs).logits
 
-        # Shift logits and labels for next token prediction
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = inputs[:, 1:]
 
-        # Compute loss
         loss_fct = nn.CrossEntropyLoss()
         loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        # Calculate negative log likelihood
         neg_log_likelihood = loss.float() * model.seqlen * (j-i)
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+        nll_sum += neg_log_likelihood
 
-    # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+        # Delete intermediate variables to free memory
+        del lm_logits, shift_logits, shift_labels, loss, neg_log_likelihood
+        torch.cuda.empty_cache()
 
-    # Empty CUDA cache to save memory
+    ppl = torch.exp(nll_sum / (nsamples * model.seqlen))
+
     torch.cuda.empty_cache()
 
     return ppl.item()
